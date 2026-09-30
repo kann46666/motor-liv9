@@ -1,4 +1,4 @@
-# worker.py – Motor / Trabajador Optimizado con Ruta de Salud (/health)
+# worker.py – Motor / Trabajador Completo con /health (GET)
 import os
 import re
 import json
@@ -287,7 +287,7 @@ app = FastAPI()
 
 @app.get("/health")
 async def health_check():
-    """Ruta limpia para que UptimeRobot confirme que el motor está despierto (Código 200)"""
+    """Ruta limpia con método GET para UptimeRobot (Código 200 OK)"""
     return {"status": "ok"}
 
 @app.post("/procesar_lote")
