@@ -1,0 +1,6 @@
+gradio>=4.44.0
+pandas>=2.2.2
+requests>=2.32.3
+beautifulsoup4>=4.12.3
+urllib3>=2.2.3
+googlesearch-python>=1.2.4  # opcional: si no lo usas, bórralo
