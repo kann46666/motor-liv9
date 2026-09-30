@@ -1,5 +1,6 @@
 pandas
 requests
 beautifulsoup4
+gradio
 uvicorn
 fastapi
