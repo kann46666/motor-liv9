@@ -1,4 +1,4 @@
-# worker.py – Motor / Trabajador con Extracción Real de 6 Vistas
+# worker.py – Motor / Trabajador Optimizado con Ruta de Salud (/health)
 import os
 import re
 import json
@@ -284,6 +284,11 @@ client = LiverpoolWorkerClient()
 
 # ====================== Servidor FastAPI / Motor ======================
 app = FastAPI()
+
+@app.get("/health")
+async def health_check():
+    """Ruta limpia para que UptimeRobot confirme que el motor está despierto (Código 200)"""
+    return {"status": "ok"}
 
 @app.post("/procesar_lote")
 async def procesar_lote(request: Request):
