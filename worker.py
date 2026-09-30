@@ -1,4 +1,4 @@
-# worker.py – Motor / Trabajador Completo con /health (GET)
+# worker.py – Motor / Trabajador en API Pura (FastAPI) sin Gradio
 import os
 import re
 import json
@@ -10,7 +10,6 @@ from urllib.parse import unquote, urljoin
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter, Retry
-import gradio as gr
 from fastapi import FastAPI, Request
 import uvicorn
 
@@ -240,7 +239,7 @@ class LiverpoolWorkerClient:
         if not imagenes_url[0]:
             html_busq = self._get_html(f"{BASE_HOME}/tienda?s={clean_sku}")
             if html_busq:
-                if 'data-testid="null-search-landing"' in html_busq or 'search-not-found-content' in html_busq:
+                if 'data-testid="null-search-landing"' in html_busq or 'search-not-force-content' in html_busq:
                     estrategia = "offline / no encontrado"
                 else:
                     cands = self.extraer_imagenes_de_html(html_busq, clean_sku)
@@ -282,13 +281,12 @@ class LiverpoolWorkerClient:
 
 client = LiverpoolWorkerClient()
 
-# ====================== Servidor FastAPI / Motor ======================
 app = FastAPI()
 
+@app.get("/")
 @app.get("/health")
-async def health_check():
-    """Ruta limpia con método GET para UptimeRobot (Código 200 OK)"""
-    return {"status": "ok"}
+async def root_health():
+    return {"status": "ok", "service": "worker"}
 
 @app.post("/procesar_lote")
 async def procesar_lote(request: Request):
@@ -328,9 +326,6 @@ async def procesar_lote(request: Request):
                 offline_dict[g].append(s)
 
     return {"valid_records": valid_records, "offline": offline_dict}
-
-demo = gr.Interface(fn=lambda: "Motor Worker Activo y Escuchando", inputs=[], outputs="text")
-demo.app = app
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
