@@ -1,4 +1,4 @@
-# worker.py – Script para los Motores (Trabajadores) en Render
+# worker.py – Motor / Trabajador con Extracción Real de 6 Vistas
 import os
 import re
 import json
@@ -36,7 +36,10 @@ def normalize_sku(raw) -> str:
 @dataclass(frozen=True)
 class ClientConfig:
     timeout: int = DEFAULT_TIMEOUT
-    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0"
+    base_pdp: str = BASE_PDP
+    base_img_fallback: str = BASE_IMG_FALLBACK
+    patron_img: str = PATRON_IMG
+    user_agent: str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
 class LiverpoolWorkerClient:
     def __init__(self, cfg: ClientConfig | None = None):
@@ -44,11 +47,13 @@ class LiverpoolWorkerClient:
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": self.cfg.user_agent,
-            "Accept-Language": "es-MX,es;q=0.9",
+            "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Connection": "close",
             "Referer": BASE_HOME,
         })
-        retries = Retry(total=1, backoff_factor=0.2, status_forcelist=(429, 500, 502, 503))
-        adapter = HTTPAdapter(max_retries=retries, pool_maxsize=10)
+        retries = Retry(total=1, backoff_factor=0.3, status_forcelist=(429, 500, 502, 503, 504), allowed_methods=frozenset(["GET", "HEAD"]), raise_on_status=False)
+        adapter = HTTPAdapter(max_retries=retries, pool_maxsize=15)
         self.session.mount("https://", adapter)
         self._img_cache = {}
 
@@ -61,44 +66,114 @@ class LiverpoolWorkerClient:
 
     def _check_single_url(self, url: str) -> bool:
         try:
+            r = self.session.head(url, timeout=3, allow_redirects=True)
+            if r.status_code == 200 and "image" in r.headers.get("Content-Type", "").lower(): return True
             rg = self.session.get(url, timeout=3, stream=True)
-            return rg.status_code == 200
+            chunk = next(rg.iter_content(chunk_size=64), b"")
+            return rg.status_code == 200 and bool(chunk)
         except: return False
 
     def _check_image_validity(self, url: str) -> bool:
         if not url: return False
         if url in self._img_cache: return self._img_cache[url]
-        v = self._check_single_url(url)
-        self._img_cache[url] = v
-        return v
+        is_valid = self._check_single_url(url)
+        self._img_cache[url] = is_valid
+        return is_valid
+
+    def _check_validity_bulk(self, urls: list[str]) -> dict[str, bool]:
+        results = {}
+        to_check = []
+        for u in urls:
+            if u in self._img_cache: results[u] = self._img_cache[u]
+            else: to_check.append(u)
+        if to_check:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                future_to_url = {executor.submit(self._check_single_url, u): u for u in to_check}
+                for future in concurrent.futures.as_completed(future_to_url):
+                    u = future_to_url[future]
+                    try: is_valid = future.result()
+                    except: is_valid = False
+                    results[u] = is_valid
+                    self._img_cache[u] = is_valid
+        return results
 
     @lru_cache(maxsize=2048)
     def buscar_slug_en_liverpool(self, sku: str) -> str:
+        if not sku: return ""
         html = self._get_html(f"{BASE_HOME}/tienda?s={sku}")
-        if not html or 'null-search-landing' in html: return ""
+        if not html: return ""
+        if 'data-testid="null-search-landing"' in html or 'search-not-found-content' in html: return ""
         soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             if "/pdp/" in a["href"]:
                 m = re.search(r"/pdp/([^/]+)/?", a["href"])
                 if m: return m.group(1).strip()
-        return ""
+        m = re.search(r"/pdp/([^/]+)/", html)
+        return m.group(1).strip() if m else ""
+
+    @lru_cache(maxsize=2048)
+    def candidatos_pdp_desde_busqueda(self, sku: str) -> list[str]:
+        out = []
+        html = self._get_html(f"{BASE_HOME}/tienda?s={sku}")
+        if not html or 'data-testid="null-search-landing"' in html or 'search-not-found-content' in html: return out
+        soup = BeautifulSoup(html, "html.parser")
+        seen = set()
+        for a in soup.find_all("a", href=True):
+            if "/pdp/" in a["href"]:
+                abs_url = urljoin(BASE_HOME, a["href"])
+                if abs_url not in seen:
+                    seen.add(abs_url)
+                    out.append(abs_url)
+        return out
+
+    def _get_prefix(self, url: str) -> str:
+        m = re.match(r"^(\d+)", url.split('/')[-1])
+        if m: return f"{url.rsplit('/', 1)[0]}/{m.group(1)}"
+        return re.sub(r"(_|-)[0-9]+[a-zA-Z]?$", "", url.replace(".jpg.jpg", ".jpg").replace(".jpg", ""))
+
+    def _deducir_base_y_variantes(self, main_img: str, thumb_imgs: list[str], html: str) -> list[str]:
+        candidatos = []
+        if main_img: candidatos.append(main_img)
+        candidatos.extend(thumb_imgs)
+        cands_uniq = []
+        for c in candidatos:
+            if c and c not in cands_uniq: cands_uniq.append(c)
+        if main_img and len(cands_uniq) < 6:
+            main_prefix = self._get_prefix(main_img)
+            extra_cands = set(u for u in re.findall(self.cfg.patron_img, html, flags=re.IGNORECASE) if u.startswith(main_prefix) and u.endswith(".jpg"))
+            extra_cands.add(f"{main_prefix}.jpg")
+            for i in range(1, 7):
+                extra_cands.update([f"{main_prefix}_{i}p.jpg", f"{main_prefix}-{i}p.jpg", f"{main_prefix}_{i}.jpg", f"{main_prefix}-{i}.jpg"])
+            for url in sorted(list(extra_cands)):
+                if url not in cands_uniq: cands_uniq.append(url)
+        validities = self._check_validity_bulk(cands_uniq)
+        finales = [u for u in cands_uniq if validities.get(u, False)]
+        return (finales + [""]*6)[:6]
 
     @lru_cache(maxsize=2048)
     def extraer_imagenes_de_html(self, html: str, sku: str = "") -> list[str]:
         if not html: return [""]*6
         soup = BeautifulSoup(html, "html.parser")
         main_img = ""
+        thumb_imgs = []
         tag_main = soup.find("img", {"data-testid": re.compile(r"gallery.*main.*image", re.I)})
         if tag_main:
-            main_img = tag_main.get("src") or tag_main.get("data-src", "")
+            src = tag_main.get("src") or tag_main.get("data-src", "")
+            if re.search(self.cfg.patron_img, src, flags=re.IGNORECASE): main_img = src
+        for tag in soup.find_all("img", {"data-testid": re.compile(r"gallery.*thumbnail.*image", re.I)}):
+            src = tag.get("src") or tag.get("data-src", "")
+            if src and re.search(self.cfg.patron_img, src, flags=re.IGNORECASE): thumb_imgs.append(src)
+        if not main_img:
+            meta_og = soup.find("meta", property="og:image")
+            if meta_og and meta_og.get("content") and re.search(self.cfg.patron_img, meta_og.get("content").strip(), flags=re.IGNORECASE):
+                main_img = meta_og.get("content").strip()
         if not main_img and sku:
-            for u in re.findall(PATRON_IMG, html, flags=re.IGNORECASE):
+            for u in re.findall(self.cfg.patron_img, html, flags=re.IGNORECASE):
                 if sku in u: main_img = u; break
-        
-        cands = [main_img] if main_img else []
-        while len(cands) < 6 and main_img:
-            cands.append(main_img)
-        return (cands + [""]*6)[:6]
+        if not main_img:
+            m = re.search(self.cfg.patron_img, html, flags=re.IGNORECASE)
+            if m: main_img = m.group(0)
+        return self._deducir_base_y_variantes(main_img, thumb_imgs, html)
 
     @lru_cache(maxsize=2048)
     def extraer_datos_pdp(self, pdp_url: str):
@@ -107,45 +182,103 @@ class LiverpoolWorkerClient:
         soup = BeautifulSoup(html, "html.parser")
         
         nombre_real = ""
-        h1 = soup.find("h1")
-        if h1: nombre_real = h1.get_text(strip=True)
+        h1_tag = soup.find("h1")
+        if h1_tag: nombre_real = h1_tag.get_text(strip=True)
 
-        estado = "Preventa" if soup.find(attrs={"data-testid": "flag-presale"}) else "Disponible"
+        estado = "Disponible"
+        presale_flag = soup.find(attrs={"data-testid": "flag-presale"})
+        if presale_flag and "preventa" in presale_flag.get_text(strip=True).lower(): estado = "Preventa"
+        else:
+            for sp in soup.find_all("span"):
+                if sp.get_text(strip=True).lower() == "preventa":
+                    estado = "Preventa"; break
 
-        def _limp(t):
-            return float(re.sub(r'[^\d.]', '', t.get_text(strip=True))) if t else 0.0
-
-        p_act = _limp(soup.find(attrs={"data-testid": "discounted"}))
-        p_orig = _limp(soup.find(attrs={"data-testid": "original"}))
+        def _limpiar_precio(tag):
+            if not tag: return 0.0
+            try: return float(re.sub(r'[^\d.]', '', tag.get_text(separator="", strip=True)))
+            except: return 0.0
+        
+        p_act = _limpiar_precio(soup.find(attrs={"data-testid": "discounted"}))
+        p_orig = _limpiar_precio(soup.find(attrs={"data-testid": "original"}))
         
         marca = ""
-        b_tag = soup.find("a", class_=lambda c: c and "ml-product-info-brand-link" in c)
-        if b_tag: marca = b_tag.get_text(strip=True)
+        brand_tag = soup.find("a", class_=lambda c: c and "ml-product-info-brand-link" in c)
+        if brand_tag: marca = brand_tag.get_text(strip=True)
             
         categoria = ""
-        nav = soup.find("nav", attrs={"data-testid": lambda x: x and str(x).endswith("-breadcrumb")})
-        if nav:
-            links = nav.find_all("a", href=re.compile(r"/tienda/.*?/cat"))
-            if links: categoria = links[0].get_text(strip=True)
+        breadcrumb_nav = soup.find("nav", attrs={"data-testid": lambda x: x and str(x).endswith("-breadcrumb")})
+        if breadcrumb_nav:
+            cat_links = breadcrumb_nav.find_all("a", href=re.compile(r"/tienda/.*?/cat"))
+            if cat_links: categoria = cat_links[0].get_text(strip=True) or cat_links[0].get("aria-label", "")
 
         return p_act, p_orig, marca, categoria, nombre_real, estado
+
+    @staticmethod
+    def _variants_fixup(url: str) -> list[str]:
+        cands = []
+        if url.endswith(".jpg") and not url.endswith(".jpg.jpg"): cands.append(url + ".jpg")
+        if url.endswith(".jpg.jpg"): cands.append(url[:-4])
+        return cands
 
     def resolver_producto(self, sku: str):
         clean_sku = normalize_sku(sku)
         if not clean_sku: return [""]*6, "", "", "invalid-sku", 0.0, 0.0, "", "", "Disponible"
 
+        urls_a_probar = [f"{BASE_PDP}/default/{clean_sku}"]
         slug = self.buscar_slug_en_liverpool(clean_sku)
-        pdp_url = f"{BASE_PDP}/{slug}/{clean_sku}" if slug else f"{BASE_PDP}/default/{clean_sku}"
-        
-        html = self._get_html(pdp_url)
-        imgs = self.extraer_imagenes_de_html(html, clean_sku)
-        
-        is_offline = not imgs[0] and not html
-        if is_offline:
-            return [""]*6, "", "", "offline / no encontrado", 0.0, 0.0, "", "", "Disponible"
+        if slug: urls_a_probar.extend([f"{BASE_PDP}/{slug}/{clean_sku}", f"{BASE_PDP}/{slug}/"])
+        urls_a_probar.extend(self.candidatos_pdp_desde_busqueda(clean_sku))
 
-        p_act, p_orig, marca, cat, name, estado = self.extraer_datos_pdp(pdp_url)
-        return imgs, pdp_url, name or slug_a_nombre(slug), "slug+sku", p_act, p_orig, marca, cat, estado
+        producto_url, imagenes_url, estrategia = "", [""]*6, "fallback"
+
+        for url in urls_a_probar:
+            cands = self.extraer_imagenes_de_html(self._get_html(url), clean_sku)
+            if cands[0]:
+                producto_url, imagenes_url, estrategia = url, cands, ("slug+sku" if url.endswith(f"/{clean_sku}") else "slug")
+                break
+
+        if not imagenes_url[0]:
+            html_busq = self._get_html(f"{BASE_HOME}/tienda?s={clean_sku}")
+            if html_busq:
+                if 'data-testid="null-search-landing"' in html_busq or 'search-not-found-content' in html_busq:
+                    estrategia = "offline / no encontrado"
+                else:
+                    cands = self.extraer_imagenes_de_html(html_busq, clean_sku)
+                    if cands[0]:
+                        imagenes_url, producto_url, estrategia = cands, f"{BASE_HOME}/tienda?s={clean_sku}", "busqueda"
+
+        if estrategia == "offline / no encontrado":
+            return [""]*6, "", "", estrategia, 0.0, 0.0, "", "", "Disponible"
+
+        def _valid_or_fix(u: str) -> tuple[str, str]:
+            if not u: return "", ""
+            if self._check_image_validity(u): return u, "valid"
+            for v in self._variants_fixup(u):
+                if self._check_image_validity(v): return v, "fixup"
+            return "", ""
+
+        if imagenes_url[0]:
+            fixed, tag = _valid_or_fix(imagenes_url[0])
+            if fixed: imagenes_url[0], estrategia = fixed, tag if tag != "valid" else estrategia
+            elif len(imagenes_url) > 1 and imagenes_url[1]:
+                fixed_var, _ = _valid_or_fix(imagenes_url[1])
+                if fixed_var: imagenes_url[0], estrategia = fixed_var, "promoted_variant"
+        
+        if not imagenes_url[0]:
+            fallback = f"{BASE_IMG_FALLBACK}{clean_sku}.jpg"
+            if self._check_image_validity(fallback): imagenes_url[0], estrategia = fallback, "fallback"
+            else: estrategia = "no-image"
+
+        producto_nombre = slug_a_nombre(slug)
+        if not producto_url and slug: producto_url = f"{BASE_PDP}/{slug}/"
+
+        p_actual, p_original, marca, categoria, nombre_real, estado = 0.0, 0.0, "", "", "", "Disponible"
+        if producto_url:
+            p_actual, p_original, marca, categoria, nombre_real, estado = self.extraer_datos_pdp(producto_url)
+
+        if nombre_real: producto_nombre = nombre_real
+
+        return imagenes_url, producto_url, producto_nombre, estrategia, p_actual, p_original, marca, categoria, estado
 
 client = LiverpoolWorkerClient()
 
