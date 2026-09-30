@@ -1,4 +1,4 @@
-# worker.py – Motor / Trabajador en API Pura (FastAPI) sin Gradio
+# worker.py – Motor / Trabajador con Interfaz Visual Gradio (Clikeable para UptimeRobot)
 import os
 import re
 import json
@@ -10,8 +10,8 @@ from urllib.parse import unquote, urljoin
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter, Retry
-from fastapi import FastAPI, Request
-import uvicorn
+import gradio as gr
+from fastapi import Request
 
 # ============================ Config ============================
 PATRON_IMG = r"https://(?:ss|sp)\d+\.liverpool\.com\.mx/(?:xl|i)/[\w\d\-\_]+\.jpg"
@@ -239,7 +239,7 @@ class LiverpoolWorkerClient:
         if not imagenes_url[0]:
             html_busq = self._get_html(f"{BASE_HOME}/tienda?s={clean_sku}")
             if html_busq:
-                if 'data-testid="null-search-landing"' in html_busq or 'search-not-force-content' in html_busq:
+                if 'data-testid="null-search-landing"' in html_busq or 'search-not-found-content' in html_busq:
                     estrategia = "offline / no encontrado"
                 else:
                     cands = self.extraer_imagenes_de_html(html_busq, clean_sku)
@@ -281,14 +281,14 @@ class LiverpoolWorkerClient:
 
 client = LiverpoolWorkerClient()
 
-app = FastAPI()
+# ====================== Interfaz Visual & API (Gradío + FastAPI) ======================
+with gr.Blocks(title="Motor Worker Liverpool") as demo:
+    gr.Markdown("# ⚙️ Motor Worker de Liverpool Activo")
+    gr.Markdown("Este servicio opera de forma síncrona recibiendo lotes de productos del Cerebro Maestro.")
+    gr.Textbox(value="Motor operando con normalidad y listo para procesar solicitudes.", label="Estado del Sistema", interactive=False)
 
-@app.get("/")
-@app.get("/health")
-async def root_health():
-    return {"status": "ok", "service": "worker"}
-
-@app.post("/procesar_lote")
+# Añadir la ruta POST directamente al servidor subyacente de Gradio
+@demo.app.post("/procesar_lote")
 async def procesar_lote(request: Request):
     data = await request.json()
     skus_lote = data.get("skus", [])
@@ -329,4 +329,4 @@ async def procesar_lote(request: Request):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    demo.launch(server_name="0.0.0.0", server_port=port)
